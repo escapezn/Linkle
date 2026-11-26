@@ -1,5 +1,5 @@
 import { is_array_of_str, last_err, to_boolean } from "./common.js";
-import { a2addUri, qbt_add } from "./rpc.js";
+import { a2addUri, describe_rpc_error, qbt_add } from "./rpc.js";
 import { get_cookies } from "./cookie.js";
 
 chrome.runtime.onInstalled.addListener(installed);
@@ -98,17 +98,31 @@ async function linkle(profile_name: string, link: string, referer: string) {
 			console.info("dry run, abort");
 			return;
 		}
-		const gid = await a2addUri(
+		const res = await a2addUri(
 			profile.url,
 			profile.token,
 			[link],
 			opts,
 			parseInt(profile.timeout),
 		);
-		if (gid !== undefined) {
-			n_items.push({ title: "Ok", message: `GID: ${gid}` });
+		if (res.error !== undefined) {
+			let msg = describe_rpc_error(res.error);
+			if (res.error.attempts !== undefined) {
+				msg += ` (after ${res.error.attempts} attempts)`;
+			}
+			n_items.push({ title: "error", message: msg });
+			if (
+				res.error.kind === "network" ||
+				res.error.kind === "timeout"
+			) {
+				n_items.push({
+					title: "error",
+					message: "may already be added, check for duplicates",
+				});
+			}
+			console.error("aria2.addUri failed:", res.error);
 		} else {
-			n_items.push({ title: "fail", message: "" });
+			n_items.push({ title: "Ok", message: `GID: ${res.gid}` });
 		}
 		chrome.notifications.update(n_id, { items: n_items });
 	} else if (profile.type === "qbt") {

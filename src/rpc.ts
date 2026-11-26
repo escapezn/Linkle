@@ -1,40 +1,132 @@
+const RPC_TIMEOUT = 10 * 1000;
+const RPC_RETRIES = 2;
+const RPC_RETRY_DELAYS = [1000, 2000];
+
+export type RpcErrorKind = "http" | "rpc" | "timeout" | "json" | "network";
+
+export interface RpcError {
+	kind: RpcErrorKind;
+	status?: number;
+	statusText?: string;
+	code?: number;
+	message?: string;
+	attempts?: number;
+}
+
+export interface A2AddUriResult {
+	gid?: string;
+	error?: RpcError;
+}
+
+function normalize_error(err: unknown): RpcError {
+	if (err == null) {
+		return { kind: "network", message: "unknown error" };
+	}
+	if (err instanceof Error && err.name === "AbortError") {
+		return { kind: "timeout", message: "request timed out" };
+	}
+	if (err instanceof SyntaxError) {
+		return { kind: "json", message: "invalid JSON response" };
+	}
+	if (typeof err === "object" && "kind" in err) {
+		return err as RpcError;
+	}
+	return {
+		kind: "network",
+		message: err instanceof Error ? err.message : String(err),
+	};
+}
+
+function should_retry(err: RpcError): boolean {
+	if (err.kind === "rpc" || err.kind === "json") {
+		return false;
+	}
+	if (
+		err.kind === "http" &&
+		err.status !== undefined &&
+		err.status >= 400 &&
+		err.status < 500 &&
+		err.status !== 408 &&
+		err.status !== 429
+	) {
+		return false;
+	}
+	return true;
+}
+
+export function describe_rpc_error(err: RpcError): string {
+	switch (err.kind) {
+		case "http":
+			return (
+				"HTTP " +
+				err.status +
+				(err.statusText != null && err.statusText !== ""
+					? " " + err.statusText
+					: "")
+			);
+		case "rpc":
+			return err.message ?? "aria2 error";
+		case "timeout":
+			return "request timed out";
+		case "json":
+			return "invalid JSON response";
+		default:
+			return err.message ?? "unknown error";
+	}
+}
+
+async function fetch_with_error(
+	url: string,
+	init: RequestInit,
+	timeout?: number, // in milliseconds
+): Promise<{ resp?: Response; error?: RpcError }> {
+	const ctrl = new AbortController();
+	const effective_timeout =
+		timeout === undefined || isNaN(timeout) ? 2501 : timeout;
+	const timer = setTimeout(() => ctrl.abort(), effective_timeout);
+	init.signal = ctrl.signal;
+
+	let resp: Response;
+	try {
+		resp = await fetch(url, init);
+	} catch (err) {
+		clearTimeout(timer);
+		const normalized = normalize_error(err);
+		console.error(`fetch ${url} error:`, err);
+		return { error: normalized };
+	}
+	clearTimeout(timer);
+	if (resp.status < 200 || resp.status >= 300) {
+		console.error(`fetch ${url}: ${resp.status} ${resp.statusText}`);
+		return {
+			error: {
+				kind: "http",
+				status: resp.status,
+				statusText: resp.statusText,
+			},
+		};
+	}
+	return { resp };
+}
+
 // fetch with timeout and error notification
 async function fetch_ex(
 	url: string,
 	init: RequestInit,
 	timeout?: number, // in milliseconds
 ): Promise<Response | undefined> {
-	const ctrl = new AbortController();
-	const timer = setTimeout(
-		() => ctrl.abort(),
-		timeout === undefined || isNaN(timeout) ? 2501 : timeout,
-	);
-	init.signal = ctrl.signal;
-
-	let resp;
-	try {
-		resp = await fetch(url, init);
-	} catch (err) {
-		// to do: notification
-		console.error(`fetch ${url} error:`, err);
-		return undefined;
-	}
-	clearTimeout(timer);
-	if (resp.status < 200 || resp.status >= 300) {
-		console.error(`fetch ${url}: ${resp.status} ${resp.statusText}`);
-		return undefined;
-	}
+	const { resp } = await fetch_with_error(url, init, timeout);
 	return resp;
 }
 
 // https://aria2.github.io/manual/en/html/aria2c.html#rpc-interface
-async function a2(
+async function a2_once(
 	url: string,
 	token: string | undefined,
 	method: string,
 	args: unknown[],
 	timeout?: number,
-): Promise<object | undefined> {
+): Promise<{ result?: unknown; error?: RpcError }> {
 	// json-rpc
 	const id = Math.random().toString();
 	const post = JSON.stringify({
@@ -43,27 +135,51 @@ async function a2(
 		method: `aria2.${method}`,
 		params: token !== undefined ? ["token:" + token, ...args] : args,
 	});
-	const resp = await fetch_ex(
+	const { resp, error } = await fetch_with_error(
 		url,
 		{
 			method: "POST",
 			body: post,
 			credentials: "omit",
-			cache: "no-store"
+			cache: "no-store",
 		},
 		timeout,
 	);
-	if (resp === undefined) {
-		return undefined;
+	if (error !== undefined || resp === undefined) {
+		return { error: error ?? { kind: "network", message: "unknown error" } };
 	}
-	const json = await resp.json();
+	let json: { id?: string; error?: { code?: number; message?: string }; result?: unknown };
+	try {
+		json = await resp.json();
+	} catch (err) {
+		const normalized = normalize_error(err);
+		console.error(`fetch ${url} json error:`, err);
+		return { error: normalized };
+	}
 	console.assert(json.id === id);
 	const err = json.error;
 	if (err !== undefined) {
 		console.error(`json-rpc error ${err.code}: ${err.message}`);
-		return undefined;
+		return {
+			error: {
+				kind: "rpc",
+				code: err.code,
+				message: err.message,
+			},
+		};
 	}
-	return json.result;
+	return { result: json.result };
+}
+
+async function a2(
+	url: string,
+	token: string | undefined,
+	method: string,
+	args: unknown[],
+	timeout?: number,
+): Promise<object | undefined> {
+	const { result } = await a2_once(url, token, method, args, timeout);
+	return result as object | undefined;
 }
 
 interface A2Opts {
@@ -76,13 +192,40 @@ export async function a2addUri(
 	uris: string[],
 	opts: A2Opts,
 	timeout?: number,
-): Promise<string> {
-	const resp = await a2(url, token, "addUri", [uris, opts], timeout);
-	if (typeof resp !== "string") {
-		console.error("expecting string, got:", resp);
-		return "";
+): Promise<A2AddUriResult> {
+	const effective_timeout =
+		timeout === undefined || isNaN(timeout) ? RPC_TIMEOUT : timeout;
+
+	for (let attempt = 0; ; attempt++) {
+		const { result, error } = await a2_once(
+			url,
+			token,
+			"addUri",
+			[uris, opts],
+			effective_timeout,
+		);
+		if (error === undefined) {
+			if (typeof result !== "string") {
+				console.error("expecting string, got:", result);
+				return {
+					error: {
+						kind: "rpc",
+						message: "unexpected aria2 response",
+						attempts: attempt + 1,
+					},
+				};
+			}
+			return { gid: result };
+		}
+		if (should_retry(error) && attempt < RPC_RETRIES) {
+			await new Promise((resolve) =>
+				setTimeout(resolve, RPC_RETRY_DELAYS[attempt]),
+			);
+			continue;
+		}
+		error.attempts = attempt + 1;
+		return { error };
 	}
-	return resp;
 }
 
 interface A2Status {
